@@ -15,7 +15,7 @@ app_flask = Flask(__name__)
 
 @app_flask.route('/')
 def home():
-    return "Gold Crypto Bot - STRONG ONLY - Running"
+    return "Gold Crypto Bot - STRONG ONLY 80%+ - Running"
 
 PAIRS = {
     "XAUUSD GOLD": "GC=F",
@@ -25,7 +25,6 @@ PAIRS = {
 
 def get_strong_only(yf_symbol, timeframe="15m"):
     try:
-        # Use 15m and 1h for bigger moves - not 5m
         df = yf.download(yf_symbol, period="5d", interval=timeframe, progress=False, auto_adjust=True)
         if len(df) < 100:
             return None
@@ -44,7 +43,6 @@ def get_strong_only(yf_symbol, timeframe="15m"):
         
         last = df.iloc[-1]
         prev = df.iloc[-2]
-        prev2 = df.iloc[-3]
         
         price = float(last['Close'])
         atr = float(last['ATR'])
@@ -58,19 +56,15 @@ def get_strong_only(yf_symbol, timeframe="15m"):
         confidence = 0
         reasons = []
         
-        # FILTER 1: No trade if RSI oversold/overbought extremes
         if rsi < 32 or rsi > 68:
-            return None  # No signal in extreme - wait
+            return None
         
-        # FILTER 2: Trend must be clear - EMA20 > EMA50 > EMA200 for BUY
         is_strong_uptrend = ema20 > ema50 > ema200
         is_strong_downtrend = ema20 < ema50 < ema200
         
-        # FILTER 3: MACD must confirm
         macd_bull = macd > 0 and macd > macd_prev
         macd_bear = macd < 0 and macd < macd_prev
         
-        # BUY Conditions - need multiple confirmations
         if is_strong_uptrend:
             confidence += 30
             reasons.append("Strong Uptrend EMA20>50>200")
@@ -87,16 +81,14 @@ def get_strong_only(yf_symbol, timeframe="15m"):
             confidence += 15
             reasons.append("Wide trend gap")
         
-        # SELL Conditions
         if is_strong_downtrend and confidence < 50:
             confidence = 0
             reasons = []
             confidence += 30
             reasons.append("Strong Downtrend EMA20<50<200")
         if 40 < rsi < 60 and rsi < prev['RSI'] and not is_strong_uptrend:
-            if not is_strong_uptrend:
-                confidence += 25
-                reasons.append(f"RSI bearish momentum {rsi:.1f}")
+            confidence += 25
+            reasons.append(f"RSI bearish momentum {rsi:.1f}")
         if macd_bear and not is_strong_uptrend:
             confidence += 25
             reasons.append("MACD bearish")
@@ -104,11 +96,9 @@ def get_strong_only(yf_symbol, timeframe="15m"):
             confidence += 30
             reasons.append("Fresh EMA bear cross")
         
-        # ONLY STRONG 80%+ allowed
         if confidence < 80:
-            return None  # No moderate, no weak - only strong
+            return None
         
-        # Determine direction
         if is_strong_uptrend or (ema20 > ema50 and macd_bull and rsi < 65):
             signal = "BUY"
             trend = "STRONG Uptrend - Big Move Expected"
@@ -116,15 +106,12 @@ def get_strong_only(yf_symbol, timeframe="15m"):
             signal = "SELL"
             trend = "STRONG Downtrend - Big Move Expected"
         
-        # BIGGER SL/TP for real points - not few points
         is_gold = "GC" in yf_symbol
         if is_gold:
-            # Gold: 100-300 points moves
             mult_sl = 3.0
             mult_tp1 = 5.0
             mult_tp2 = 9.0
         else:
-            # BTC/ETH: bigger
             mult_sl = 2.5
             mult_tp1 = 4.5
             mult_tp2 = 8.0
@@ -228,7 +215,6 @@ def run_bot():
     app.add_handler(CommandHandler("gold", gold_cmd))
     app.add_handler(CommandHandler("btc", btc_cmd))
     app.add_handler(CommandHandler("eth", eth_cmd))
-    # Check every 15 min for strong signals only - not every 5 min
     app.job_queue.run_repeating(auto_check, interval=900, first=30)
     print("Bot running - STRONG ONLY 80%+ - Big Points")
     app.run_polling()
