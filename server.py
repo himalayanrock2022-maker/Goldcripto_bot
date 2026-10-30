@@ -1,8 +1,6 @@
-"""
 FINAL WAIT LOGIC - Gold Only Real Market - 70% Accuracy
 Agar 70%+ trade banti hai to SIGNAL, nahi to WAIT ka bolega
 No random, No ETH, No same repeat - Real market only
-"""
 import os, requests, time, threading
 from flask import Flask
 
