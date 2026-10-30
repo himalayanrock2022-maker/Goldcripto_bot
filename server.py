@@ -10,24 +10,22 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = "-1003953683540"
 
 app = Flask(__name__)
-
-last_signal_price = None
-last_signal_time = 0
-last_signal_side = None
-last_candle_time = None
-
-SCAN_INTERVAL = 900
-MIN_SCORE = 70
-
 session = requests.Session()
-session.headers.update({
-    "User-Agent": "Mozilla/5.0"
-})
+
+MIN_SCORE = 70
+SCAN_INTERVAL = 900
+SYMBOL = "XAUUSD=X"
+
+last_candle = None
+last_signal_key = None
+last_signal_time = 0
+
+pending_breakout = None
 
 
-def send_msg(text):
+def send_msg(message):
     if not BOT_TOKEN:
-        print("ERROR: BOT_TOKEN missing")
+        print("BOT_TOKEN missing")
         return False
 
     try:
@@ -35,26 +33,24 @@ def send_msg(text):
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
             json={
                 "chat_id": CHANNEL_ID,
-                "text": text,
-                "parse_mode": "Markdown"
+                "text": message
             },
             timeout=15
         )
         r.raise_for_status()
         return r.json().get("ok", False)
-
     except Exception as e:
         print("Telegram error:", e)
         return False
 
 
-# REAL GOLD MARKET DATA - XAU/USD
-def get_gold_candles():
-
+# REAL XAU/USD DATA
+def get_candles():
     try:
         url = (
             "https://query1.finance.yahoo.com/v8/finance/chart/"
-            "XAUUSD=X?interval=15m&range=5d"
+            + SYMBOL
+            + "?interval=15m&range=5d"
         )
 
         r = session.get(url, timeout=15)
@@ -66,63 +62,61 @@ def get_gold_candles():
             return None
 
         data = result[0]
-
         timestamps = data["timestamp"]
         quote = data["indicators"]["quote"][0]
 
         candles = []
 
+        current_slot = int(time.time() // 900) * 900
+
         for i, ts in enumerate(timestamps):
+            o = quote["open"][i]
+            h = quote["high"][i]
+            l = quote["low"][i]
+            c = quote["close"][i]
 
-            close = quote["close"][i]
-            high = quote["high"][i]
-            low = quote["low"][i]
+            if None in (o, h, l, c):
+                continue
 
-            if close is None or high is None or low is None:
+            if ts >= current_slot:
                 continue
 
             candles.append({
                 "time": ts,
-                "close": float(close),
-                "high": float(high),
-                "low": float(low)
+                "open": float(o),
+                "high": float(h),
+                "low": float(l),
+                "close": float(c)
             })
 
-        # Only completed 15-minute candles
-        current_slot = int(time.time() // 900) * 900
-
-        candles = [
-            c for c in candles
-            if c["time"] < current_slot
-        ]
-
         if len(candles) < 60:
+            return None
+
+        # Reject stale market data
+        if time.time() - candles[-1]["time"] > 3600:
             return None
 
         return candles[-100:]
 
     except Exception as e:
-        print("Gold data error:", e)
+        print("Market data error:", e)
         return None
 
 
 def ema(values, period):
-
     if len(values) < period:
         return None
 
     k = 2 / (period + 1)
-
     value = sum(values[:period]) / period
 
-    for price in values[period:]:
-        value = price * k + value * (1 - k)
+    for p in values[period:]:
+        value = p * k + value * (1 - k)
 
     return value
 
 
-def rsi(values, period=14):
-
+def calculate_rsi(values, period=14):
     if len(values) < period + 1:
         return None
 
@@ -138,7 +132,6 @@ def rsi(values, period=14):
     avg_loss = sum(losses[:period]) / period
 
     for i in range(period, len(changes)):
-
         avg_gain = (
             avg_gain * (period - 1) + gains[i]
         ) / period
@@ -151,27 +144,21 @@ def rsi(values, period=14):
         return 100
 
     rs = avg_gain / avg_loss
-
     return 100 - (100 / (1 + rs))
 
 
-def atr(candles, period=14):
-
+def calculate_atr(candles, period=14):
     trs = []
 
     for i in range(1, len(candles)):
+        c = candles[i]
+        prev = candles[i - 1]["close"]
 
-        high = candles[i]["high"]
-        low = candles[i]["low"]
-        previous = candles[i - 1]["close"]
-
-        tr = max(
-            high - low,
-            abs(high - previous),
-            abs(low - previous)
-        )
-
-        trs.append(tr)
+        trs.append(max(
+            c["high"] - c["low"],
+            abs(c["high"] - prev),
+            abs(c["low"] - prev)
+        ))
 
     if len(trs) < period:
         return None
@@ -186,296 +173,336 @@ def atr(candles, period=14):
     return value
 
 
-def analyze_gold():
+def analyze():
 
-    candles = get_gold_candles()
+    global pending_breakout
+
+    candles = get_candles()
 
     if not candles:
         return None
 
     closes = [c["close"] for c in candles]
 
-    price = closes[-1]
+    current = candles[-1]
+    previous = candles[-2]
 
-    ema20 = ema(closes, 20)
-    ema50 = ema(closes, 50)
+    price = current["close"]
 
-    rsi_value = rsi(closes)
-    atr_value = atr(candles)
+    e20 = ema(closes, 20)
+    e50 = ema(closes, 50)
+    rsi = calculate_rsi(closes)
+    atr = calculate_atr(candles)
 
-    if None in (ema20, ema50, rsi_value, atr_value):
+    if None in (e20, e50, rsi, atr) or atr <= 0:
         return None
 
-    if atr_value <= 0:
-        return None
+    # Levels calculated from preceding candles
+    history = candles[-21:-1]
 
-    previous_ema20 = ema(closes[:-1], 20)
-
-    if previous_ema20 is None:
-        return None
-
-    # MACD
-    macd = ema(closes, 12) - ema(closes, 26)
-
-    macd_signal = ema(
-        [
-            ema(closes[:i + 1], 12) -
-            ema(closes[:i + 1], 26)
-            for i in range(25, len(closes))
-        ],
-        9
-    )
-
-    if macd_signal is None:
-        return None
-
-    # Market structure
-    support = min(c["low"] for c in candles[-20:])
-    resistance = max(c["high"] for c in candles[-20:])
+    support = min(c["low"] for c in history)
+    resistance = max(c["high"] for c in history)
 
     bullish = 0
     bearish = 0
 
-    # Trend confirmation
-    if price > ema20 and ema20 > ema50:
-        bullish += 25
+    # Trend
+    if price > e20 > e50:
+        bullish += 20
 
-    if price < ema20 and ema20 < ema50:
-        bearish += 25
+    if price < e20 < e50:
+        bearish += 20
 
-    # Price position
-    if price > ema20:
+    # Momentum
+    if price > previous["close"]:
         bullish += 10
 
-    if price < ema20:
+    if price < previous["close"]:
         bearish += 10
 
-    # RSI confirmation
-    if 52 <= rsi_value <= 68:
+    # RSI - avoid extreme entries
+    if 45 <= rsi <= 68:
         bullish += 15
 
-    if 32 <= rsi_value <= 48:
+    if 32 <= rsi <= 55:
         bearish += 15
 
-    # MACD confirmation
-    if macd > macd_signal:
-        bullish += 15
-
-    if macd < macd_signal:
-        bearish += 15
-
-    # Momentum confirmation
-    if closes[-1] > closes[-2] > closes[-3]:
-        bullish += 15
-
-    if closes[-1] < closes[-2] < closes[-3]:
-        bearish += 15
-
-    # EMA direction
-    if ema20 > previous_ema20:
+    # EMA position
+    if price > e20:
         bullish += 10
 
-    if ema20 < previous_ema20:
+    if price < e20:
         bearish += 10
 
-    # Candle confirmation
-    last_candle = candles[-1]
+    # Strong candle body
+    body = abs(current["close"] - current["open"])
+    candle_range = current["high"] - current["low"]
+
+    if candle_range > 0:
+        if (
+            current["close"] > current["open"]
+            and body / candle_range >= 0.55
+        ):
+            bullish += 15
+
+        if (
+            current["close"] < current["open"]
+            and body / candle_range >= 0.55
+        ):
+            bearish += 15
+
+    # SUPPORT REJECTION
+    lower_wick = (
+        min(current["open"], current["close"])
+        - current["low"]
+    )
+
+    upper_wick = (
+        current["high"]
+        - max(current["open"], current["close"])
+    )
+
+    buy_rejection = (
+        current["low"] <= support + atr * 0.25
+        and current["close"] > support + atr * 0.15
+        and current["close"] > current["open"]
+        and lower_wick > max(body * 1.2, atr * 0.15)
+        and 40 <= rsi <= 70
+    )
+
+    # RESISTANCE REJECTION
+    sell_rejection = (
+        current["high"] >= resistance - atr * 0.25
+        and current["close"] < resistance - atr * 0.15
+        and current["close"] < current["open"]
+        and upper_wick > max(body * 1.2, atr * 0.15)
+        and 30 <= rsi <= 60
+    )
+
+    # BREAKOUT DETECTION
+    buffer = atr * 0.15
 
     if (
-        last_candle["close"] >
-        last_candle["low"] +
-        (last_candle["high"] - last_candle["low"]) * 0.65
+        current["close"] > resistance + buffer
+        and current["close"] > current["open"]
     ):
-        bullish += 10
+        pending_breakout = {
+            "side": "BUY",
+            "level": resistance,
+            "time": current["time"]
+        }
 
-    if (
-        last_candle["close"] <
-        last_candle["low"] +
-        (last_candle["high"] - last_candle["low"]) * 0.35
+    elif (
+        current["close"] < support - buffer
+        and current["close"] < current["open"]
     ):
-        bearish += 10
+        pending_breakout = {
+            "side": "SELL",
+            "level": support,
+            "time": current["time"]
+        }
 
+    # BREAKOUT RETEST
+    buy_retest = False
+    sell_retest = False
+
+    if pending_breakout:
+
+        level = pending_breakout["level"]
+        age = current["time"] - pending_breakout["time"]
+
+        if age > 0 and age <= 4 * 900:
+
+            if pending_breakout["side"] == "BUY":
+                buy_retest = (
+                    current["low"] <= level + atr * 0.25
+                    and current["close"] > level + atr * 0.05
+                    and current["close"] > current["open"]
+                    and rsi < 75
+                )
+
+            if pending_breakout["side"] == "SELL":
+                sell_retest = (
+                    current["high"] >= level - atr * 0.25
+                    and current["close"] < level - atr * 0.05
+                    and current["close"] < current["open"]
+                    and rsi > 25
+                )
+
+        else:
+            pending_breakout = None
+
+    # SETUP DECISION
     side = "WAIT"
-    score = max(bullish, bearish)
+    setup = "NONE"
+    score = 0
 
-    if bullish >= MIN_SCORE and bullish > bearish:
+    if buy_retest:
         side = "BUY"
+        setup = "BREAKOUT RETEST"
+        score = min(95, 70 + bullish // 5)
+        pending_breakout = None
 
-    elif bearish >= MIN_SCORE and bearish > bullish:
+    elif sell_retest:
         side = "SELL"
+        setup = "BREAKDOWN RETEST"
+        score = min(95, 70 + bearish // 5)
+        pending_breakout = None
 
-    result = {
+    elif buy_rejection and bullish >= 35:
+        side = "BUY"
+        setup = "SUPPORT REJECTION"
+        score = min(95, 65 + bullish // 3)
+
+    elif sell_rejection and bearish >= 35:
+        side = "SELL"
+        setup = "RESISTANCE REJECTION"
+        score = min(95, 65 + bearish // 3)
+
+    # RSI extreme protection
+    if side == "BUY" and rsi >= 75:
+        side = "WAIT"
+
+    if side == "SELL" and rsi <= 25:
+        side = "WAIT"
+
+    if score < MIN_SCORE:
+        side = "WAIT"
+
+    return {
         "side": side,
-        "price": price,
-        "rsi": rsi_value,
-        "ema20": ema20,
-        "ema50": ema50,
-        "atr": atr_value,
+        "setup": setup,
         "score": score,
+        "price": price,
+        "rsi": rsi,
+        "ema20": e20,
+        "ema50": e50,
+        "atr": atr,
         "support": support,
         "resistance": resistance,
-        "candle_time": candles[-1]["time"]
+        "time": current["time"]
     }
 
-    if side == "BUY":
 
-        result["sl"] = price - atr_value * 1.5
-        result["tp1"] = price + atr_value * 1.5
-        result["tp2"] = price + atr_value * 2.5
-        result["tp_big"] = price + atr_value * 3.5
+def run_bot():
 
-    elif side == "SELL":
-
-        result["sl"] = price + atr_value * 1.5
-        result["tp1"] = price - atr_value * 1.5
-        result["tp2"] = price - atr_value * 2.5
-        result["tp_big"] = price - atr_value * 3.5
-
-    return result
-
-
-def run_wait_logic():
-
-    global last_signal_price
+    global last_candle
+    global last_signal_key
     global last_signal_time
-    global last_signal_side
-    global last_candle_time
 
-    data = analyze_gold()
+    data = analyze()
 
-    if data is None:
-
-        print("WAIT: Real Gold data unavailable")
-
-        send_msg(
-            "⚠️ *GOLD DATA UNAVAILABLE*\n\n"
-            "Real market candles could not be verified.\n"
-            "No trade signal generated.\n"
-            "⏳ WAIT"
-        )
-
+    if not data:
+        print("WAIT: Gold market data unavailable")
         return
+
+    candle_time = data["time"]
+
+    # One scan per completed candle
+    if candle_time == last_candle:
+        return
+
+    last_candle = candle_time
 
     side = data["side"]
     price = data["price"]
 
-    candle_time = data["candle_time"]
-
-    candle_text = datetime.fromtimestamp(
-        candle_time,
-        timezone.utc
+    candle_label = datetime.fromtimestamp(
+        candle_time, timezone.utc
     ).strftime("%Y-%m-%d %H:%M UTC")
 
-    # No duplicate candle processing
-    if candle_time == last_candle_time:
-        return
+    if side == "WAIT":
 
-    last_candle_time = candle_time
-
-    # Signal suppression
-    if side in ("BUY", "SELL"):
-
-        same_trade = (
-            last_signal_side == side
-            and last_signal_price is not None
-            and abs(price - last_signal_price) < 3
-            and time.time() - last_signal_time < 7200
-        )
-
-        if same_trade:
-            print("Duplicate signal suppressed")
-            return
-
-        message = (
-            f"📊 *{side} - XAU/USD GOLD*\n"
-            f"*Setup Score: {data['score']}/100*\n\n"
-
-            f"💰 Live Price: {price:.2f}\n"
-            f"📈 RSI: {data['rsi']:.1f}\n"
-            f"EMA20: {data['ema20']:.2f}\n"
-            f"EMA50: {data['ema50']:.2f}\n"
-            f"ATR: {data['atr']:.2f}\n\n"
-
-            f"Support: {data['support']:.2f}\n"
-            f"Resistance: {data['resistance']:.2f}\n\n"
-
-            f"🎯 Entry: {price:.2f}\n"
-            f"🛑 SL: {data['sl']:.2f}\n"
-            f"✅ TP1: {data['tp1']:.2f}\n"
-            f"✅ TP2: {data['tp2']:.2f}\n"
-            f"🚀 BIG TP: {data['tp_big']:.2f}\n\n"
-
-            f"⏰ Candle: {candle_text}\n"
-            f"Gold Only | 15M | Real Market Data\n"
-            f"⚠️ Setup score is not guaranteed accuracy."
-        )
-
-        if send_msg(message):
-
-            last_signal_price = price
-            last_signal_time = time.time()
-            last_signal_side = side
-
-    else:
-
-        direction = (
-            "BUY setup confirmation ka wait"
-            if price > data["ema20"]
-            else "SELL setup confirmation ka wait"
-        )
-
-        message = (
-            "⏳ *WAIT - NO TRADE*\n"
-            "*XAU/USD GOLD*\n\n"
-
-            f"💰 Live: {price:.2f}\n"
+        msg = (
+            "⏳ WAIT - XAU/USD GOLD\n\n"
+            f"Price: {price:.2f}\n"
             f"RSI: {data['rsi']:.1f}\n"
             f"EMA20: {data['ema20']:.2f}\n"
             f"EMA50: {data['ema50']:.2f}\n\n"
-
-            f"Setup Score: {data['score']}/100\n"
-            f"Required: {MIN_SCORE}/100\n\n"
-
             f"Support: {data['support']:.2f}\n"
             f"Resistance: {data['resistance']:.2f}\n\n"
-
-            f"📌 {direction}\n"
-            f"⏰ Next scan: 15 minutes\n"
-            f"🚫 No random trade."
+            "No confirmed rejection/retest.\n"
+            "Wait for next completed 15M candle."
         )
 
-        send_msg(message)
+        send_msg(msg)
+        return
+
+    signal_key = (
+        side,
+        data["setup"],
+        round(price, 1)
+    )
+
+    if signal_key == last_signal_key:
+        return
+
+    if time.time() - last_signal_time < 1800:
+        return
+
+    if side == "BUY":
+        sl = price - data["atr"] * 1.5
+        tp1 = price + data["atr"] * 1.5
+        tp2 = price + data["atr"] * 2.5
+        tp3 = price + data["atr"] * 3.5
+
+    else:
+        sl = price + data["atr"] * 1.5
+        tp1 = price - data["atr"] * 1.5
+        tp2 = price - data["atr"] * 2.5
+        tp3 = price - data["atr"] * 3.5
+
+    msg = (
+        f"📈 {side} - XAU/USD GOLD\n"
+        f"Setup: {data['setup']}\n"
+        f"Technical Score: {data['score']}/100\n\n"
+
+        f"Entry: {price:.2f}\n"
+        f"SL: {sl:.2f}\n"
+        f"TP1: {tp1:.2f}\n"
+        f"TP2: {tp2:.2f}\n"
+        f"BIG TP: {tp3:.2f}\n\n"
+
+        f"RSI: {data['rsi']:.1f}\n"
+        f"EMA20: {data['ema20']:.2f}\n"
+        f"EMA50: {data['ema50']:.2f}\n\n"
+
+        f"Support: {data['support']:.2f}\n"
+        f"Resistance: {data['resistance']:.2f}\n\n"
+
+        f"Candle: {candle_label}\n"
+        "Gold Only | 15M | Real Market Feed\n"
+        "Score is not guaranteed win probability."
+    )
+
+    if send_msg(msg):
+        last_signal_key = signal_key
+        last_signal_time = time.time()
 
 
 @app.route("/")
 def home():
+    candles = get_candles()
 
-    data = get_gold_candles()
-
-    if not data:
+    if not candles:
         return "Gold data unavailable - WAIT"
 
     return (
-        f"GOLD SIGNAL BOT ACTIVE | "
-        f"XAU/USD: {data[-1]['close']:.2f}"
+        "GOLD REJECTION + BREAKOUT BOT ACTIVE | "
+        + str(candles[-1]["close"])
     )
 
 
 @app.route("/test")
 def test():
-
-    run_wait_logic()
-
+    run_bot()
     return "Gold scan completed. Check Telegram."
 
 
 def auto():
-
     while True:
-
         try:
-            run_wait_logic()
-
+            run_bot()
         except Exception as e:
             print("Bot error:", e)
 
