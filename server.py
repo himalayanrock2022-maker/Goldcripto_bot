@@ -2,521 +2,333 @@
 import os
 import time
 import threading
+import logging
 import requests
-from datetime import datetime, timezone
-from flask import Flask
+import yfinance as yf
+import pandas as pd
+from flask import Flask, jsonify
 
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = "-1003953683540"
+# =============== CONFIGURATION ===============
+
+BOT_TOKEN = os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+CHECK_SECONDS = 900  # 15 minutes
+TIMEFRAME = "15m"
+
+ASSETS = {
+    "XAUUSD": "XAUUSD=X",
+    "ETHUSD": "ETH-USD",
+    "BTCUSD": "BTC-USD",
+    "USOIL": "CL=F"
+}
 
 app = Flask(__name__)
-session = requests.Session()
+logging.basicConfig(level=logging.INFO)
 
-MIN_SCORE = 70
-SCAN_INTERVAL = 900
-SYMBOL = "XAUUSD=X"
+last_signals = {}
+last_candle_times = {}
+bot_started = False
 
-last_candle = None
-last_signal_key = None
-last_signal_time = 0
+# =============== TELEGRAM ===============
 
-pending_breakout = None
-
-
-def send_msg(message):
-    if not BOT_TOKEN:
-        print("BOT_TOKEN missing")
+def send_telegram(message):
+    if not BOT_TOKEN or not CHAT_ID:
+        logging.error("Telegram credentials missing")
         return False
 
     try:
-        r = session.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": CHANNEL_ID,
-                "text": message
-            },
-            timeout=15
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+
+        response = requests.post(
+            url,
+            data={"chat_id": CHAT_ID, "text": message},
+            timeout=20
         )
-        r.raise_for_status()
-        return r.json().get("ok", False)
+
+        result = response.json()
+        logging.info("Telegram: %s", result)
+        return result.get("ok", False)
+
     except Exception as e:
-        print("Telegram error:", e)
+        logging.error("Telegram error: %s", e)
         return False
 
 
-# REAL XAU/USD DATA
-def get_candles():
+# =============== MARKET DATA ===============
+
+def get_data(symbol):
     try:
-        url = (
-            "https://query1.finance.yahoo.com/v8/finance/chart/"
-            + SYMBOL
-            + "?interval=15m&range=5d"
+        df = yf.Ticker(symbol).history(
+            period="5d",
+            interval=TIMEFRAME,
+            auto_adjust=False
         )
 
-        r = session.get(url, timeout=15)
-        r.raise_for_status()
-
-        result = r.json()["chart"]["result"]
-
-        if not result:
+        if df is None or len(df) < 60:
+            logging.warning("Insufficient data: %s", symbol)
             return None
 
-        data = result[0]
-        timestamps = data["timestamp"]
-        quote = data["indicators"]["quote"][0]
+        df = df.dropna()
 
-        candles = []
+        # Ignore the latest possibly incomplete candle
+        df = df.iloc[:-1].copy()
 
-        current_slot = int(time.time() // 900) * 900
-
-        for i, ts in enumerate(timestamps):
-            o = quote["open"][i]
-            h = quote["high"][i]
-            l = quote["low"][i]
-            c = quote["close"][i]
-
-            if None in (o, h, l, c):
-                continue
-
-            if ts >= current_slot:
-                continue
-
-            candles.append({
-                "time": ts,
-                "open": float(o),
-                "high": float(h),
-                "low": float(l),
-                "close": float(c)
-            })
-
-        if len(candles) < 60:
+        if len(df) < 55:
             return None
 
-        # Reject stale market data
-        if time.time() - candles[-1]["time"] > 3600:
+        # Reject stale data
+        latest_time = df.index[-1]
+        now = pd.Timestamp.now(tz="UTC")
+
+        if latest_time.tzinfo is None:
+            latest_time = latest_time.tz_localize("UTC")
+
+        if (now - latest_time).total_seconds() > 3600:
+            logging.warning("Stale data: %s", symbol)
             return None
 
-        return candles[-100:]
+        return df
 
     except Exception as e:
-        print("Market data error:", e)
+        logging.error("Data error %s: %s", symbol, e)
         return None
 
 
-def ema(values, period):
-    if len(values) < period:
+# =============== INDICATORS ===============
+
+def indicators(df):
+    df = df.copy()
+
+    close = df["Close"]
+    high = df["High"]
+    low = df["Low"]
+
+    df["EMA20"] = close.ewm(span=20, adjust=False).mean()
+    df["EMA50"] = close.ewm(span=50, adjust=False).mean()
+
+    delta = close.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1/14, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/14, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace(0, 0.000001)
+    df["RSI"] = 100 - (100 / (1 + rs))
+
+    previous_close = close.shift(1)
+
+    tr = pd.concat([
+        high - low,
+        (high - previous_close).abs(),
+        (low - previous_close).abs()
+    ], axis=1).max(axis=1)
+
+    df["ATR"] = tr.rolling(14).mean()
+
+    return df.dropna()
+
+
+# =============== ANALYSIS ===============
+
+def analyze_asset(name, symbol):
+    df = get_data(symbol)
+
+    if df is None:
         return None
 
-    k = 2 / (period + 1)
-    value = sum(values[:period]) / period
+    df = indicators(df)
 
-    for p in values[period:]:
-        value = p * k + value * (1 - k)
-
-    return value
-
-
-def calculate_rsi(values, period=14):
-    if len(values) < period + 1:
+    if len(df) < 25:
         return None
 
-    changes = [
-        values[i] - values[i - 1]
-        for i in range(1, len(values))
-    ]
+    current = df.iloc[-1]
+    previous = df.iloc[-2]
 
-    gains = [max(x, 0) for x in changes]
-    losses = [max(-x, 0) for x in changes]
+    price = float(current["Close"])
+    ema20 = float(current["EMA20"])
+    ema50 = float(current["EMA50"])
+    rsi = float(current["RSI"])
+    atr = float(current["ATR"])
 
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
+    candle_time = str(df.index[-1])
 
-    for i in range(period, len(changes)):
-        avg_gain = (
-            avg_gain * (period - 1) + gains[i]
-        ) / period
-
-        avg_loss = (
-            avg_loss * (period - 1) + losses[i]
-        ) / period
-
-    if avg_loss == 0:
-        return 100
-
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def calculate_atr(candles, period=14):
-    trs = []
-
-    for i in range(1, len(candles)):
-        c = candles[i]
-        prev = candles[i - 1]["close"]
-
-        trs.append(max(
-            c["high"] - c["low"],
-            abs(c["high"] - prev),
-            abs(c["low"] - prev)
-        ))
-
-    if len(trs) < period:
+    if atr <= 0:
         return None
 
-    value = sum(trs[:period]) / period
+    # Support/resistance from previous candles
+    support = float(df["Low"].iloc[-22:-2].min())
+    resistance = float(df["High"].iloc[-22:-2].max())
 
-    for tr in trs[period:]:
-        value = (
-            value * (period - 1) + tr
-        ) / period
+    bullish = ema20 > ema50
+    bearish = ema20 < ema50
 
-    return value
+    candle_range = float(current["High"] - current["Low"])
 
-
-def analyze():
-
-    global pending_breakout
-
-    candles = get_candles()
-
-    if not candles:
+    if candle_range <= 0:
         return None
 
-    closes = [c["close"] for c in candles]
+    lower_wick = min(
+        float(current["Open"]),
+        float(current["Close"])
+    ) - float(current["Low"])
 
-    current = candles[-1]
-    previous = candles[-2]
-
-    price = current["close"]
-
-    e20 = ema(closes, 20)
-    e50 = ema(closes, 50)
-    rsi = calculate_rsi(closes)
-    atr = calculate_atr(candles)
-
-    if None in (e20, e50, rsi, atr) or atr <= 0:
-        return None
-
-    # Levels calculated from preceding candles
-    history = candles[-21:-1]
-
-    support = min(c["low"] for c in history)
-    resistance = max(c["high"] for c in history)
-
-    bullish = 0
-    bearish = 0
-
-    # Trend
-    if price > e20 > e50:
-        bullish += 20
-
-    if price < e20 < e50:
-        bearish += 20
-
-    # Momentum
-    if price > previous["close"]:
-        bullish += 10
-
-    if price < previous["close"]:
-        bearish += 10
-
-    # RSI - avoid extreme entries
-    if 45 <= rsi <= 68:
-        bullish += 15
-
-    if 32 <= rsi <= 55:
-        bearish += 15
-
-    # EMA position
-    if price > e20:
-        bullish += 10
-
-    if price < e20:
-        bearish += 10
-
-    # Strong candle body
-    body = abs(current["close"] - current["open"])
-    candle_range = current["high"] - current["low"]
-
-    if candle_range > 0:
-        if (
-            current["close"] > current["open"]
-            and body / candle_range >= 0.55
-        ):
-            bullish += 15
-
-        if (
-            current["close"] < current["open"]
-            and body / candle_range >= 0.55
-        ):
-            bearish += 15
-
-    # SUPPORT REJECTION
-    lower_wick = (
-        min(current["open"], current["close"])
-        - current["low"]
+    upper_wick = float(current["High"]) - max(
+        float(current["Open"]),
+        float(current["Close"])
     )
 
-    upper_wick = (
-        current["high"]
-        - max(current["open"], current["close"])
+    # BUY: support rejection or confirmed resistance breakout
+    support_rejection = (
+        float(current["Low"]) <= support + atr * 0.20
+        and price > support
+        and lower_wick > candle_range * 0.30
+        and price > float(current["Open"])
     )
 
-    buy_rejection = (
-        current["low"] <= support + atr * 0.25
-        and current["close"] > support + atr * 0.15
-        and current["close"] > current["open"]
-        and lower_wick > max(body * 1.2, atr * 0.15)
-        and 40 <= rsi <= 70
+    breakout_buy = (
+        float(previous["Close"]) <= resistance
+        and price > resistance + atr * 0.10
     )
 
-    # RESISTANCE REJECTION
-    sell_rejection = (
-        current["high"] >= resistance - atr * 0.25
-        and current["close"] < resistance - atr * 0.15
-        and current["close"] < current["open"]
-        and upper_wick > max(body * 1.2, atr * 0.15)
-        and 30 <= rsi <= 60
+    # SELL: resistance rejection or support breakdown
+    resistance_rejection = (
+        float(current["High"]) >= resistance - atr * 0.20
+        and price < resistance
+        and upper_wick > candle_range * 0.30
+        and price < float(current["Open"])
     )
 
-    # BREAKOUT DETECTION
-    buffer = atr * 0.15
+    breakout_sell = (
+        float(previous["Close"]) >= support
+        and price < support - atr * 0.10
+    )
 
-    if (
-        current["close"] > resistance + buffer
-        and current["close"] > current["open"]
-    ):
-        pending_breakout = {
-            "side": "BUY",
-            "level": resistance,
-            "time": current["time"]
-        }
+    direction = None
+    reason = None
 
-    elif (
-        current["close"] < support - buffer
-        and current["close"] < current["open"]
-    ):
-        pending_breakout = {
-            "side": "SELL",
-            "level": support,
-            "time": current["time"]
-        }
+    if bullish and 45 <= rsi <= 68:
+        if support_rejection:
+            direction = "BUY"
+            reason = "Support rejection"
+        elif breakout_buy:
+            direction = "BUY"
+            reason = "Resistance breakout"
 
-    # BREAKOUT RETEST
-    buy_retest = False
-    sell_retest = False
+    if bearish and 32 <= rsi <= 55:
+        if resistance_rejection:
+            direction = "SELL"
+            reason = "Resistance rejection"
+        elif breakout_sell:
+            direction = "SELL"
+            reason = "Support breakdown"
 
-    if pending_breakout:
-
-        level = pending_breakout["level"]
-        age = current["time"] - pending_breakout["time"]
-
-        if age > 0 and age <= 4 * 900:
-
-            if pending_breakout["side"] == "BUY":
-                buy_retest = (
-                    current["low"] <= level + atr * 0.25
-                    and current["close"] > level + atr * 0.05
-                    and current["close"] > current["open"]
-                    and rsi < 75
-                )
-
-            if pending_breakout["side"] == "SELL":
-                sell_retest = (
-                    current["high"] >= level - atr * 0.25
-                    and current["close"] < level - atr * 0.05
-                    and current["close"] < current["open"]
-                    and rsi > 25
-                )
-
-        else:
-            pending_breakout = None
-
-    # SETUP DECISION
-    side = "WAIT"
-    setup = "NONE"
-    score = 0
-
-    if buy_retest:
-        side = "BUY"
-        setup = "BREAKOUT RETEST"
-        score = min(95, 70 + bullish // 5)
-        pending_breakout = None
-
-    elif sell_retest:
-        side = "SELL"
-        setup = "BREAKDOWN RETEST"
-        score = min(95, 70 + bearish // 5)
-        pending_breakout = None
-
-    elif buy_rejection and bullish >= 35:
-        side = "BUY"
-        setup = "SUPPORT REJECTION"
-        score = min(95, 65 + bullish // 3)
-
-    elif sell_rejection and bearish >= 35:
-        side = "SELL"
-        setup = "RESISTANCE REJECTION"
-        score = min(95, 65 + bearish // 3)
-
-    # RSI extreme protection
-    if side == "BUY" and rsi >= 75:
-        side = "WAIT"
-
-    if side == "SELL" and rsi <= 25:
-        side = "WAIT"
-
-    if score < MIN_SCORE:
-        side = "WAIT"
-
-    return {
-        "side": side,
-        "setup": setup,
-        "score": score,
-        "price": price,
-        "rsi": rsi,
-        "ema20": e20,
-        "ema50": e50,
-        "atr": atr,
-        "support": support,
-        "resistance": resistance,
-        "time": current["time"]
-    }
-
-
-def run_bot():
-
-    global last_candle
-    global last_signal_key
-    global last_signal_time
-
-    data = analyze()
-
-    if not data:
-        print("WAIT: Gold market data unavailable")
-        return
-
-    candle_time = data["time"]
-
-    # One scan per completed candle
-    if candle_time == last_candle:
-        return
-
-    last_candle = candle_time
-
-    side = data["side"]
-    price = data["price"]
-
-    candle_label = datetime.fromtimestamp(
-        candle_time, timezone.utc
-    ).strftime("%Y-%m-%d %H:%M UTC")
-
-    if side == "WAIT":
-
-        msg = (
-            "⏳ WAIT - XAU/USD GOLD\n\n"
-            f"Price: {price:.2f}\n"
-            f"RSI: {data['rsi']:.1f}\n"
-            f"EMA20: {data['ema20']:.2f}\n"
-            f"EMA50: {data['ema50']:.2f}\n\n"
-            f"Support: {data['support']:.2f}\n"
-            f"Resistance: {data['resistance']:.2f}\n\n"
-            "No confirmed rejection/retest.\n"
-            "Wait for next completed 15M candle."
+    if direction is None:
+        logging.info(
+            "%s WAIT | Price %.4f | RSI %.1f",
+            name, price, rsi
         )
+        return None
 
-        send_msg(msg)
-        return
+    # Avoid duplicate signal on the same candle
+    signal_key = f"{name}_{direction}_{candle_time}"
 
-    signal_key = (
-        side,
-        data["setup"],
-        round(price, 1)
-    )
+    if last_signals.get(name) == signal_key:
+        return None
 
-    if signal_key == last_signal_key:
-        return
-
-    if time.time() - last_signal_time < 1800:
-        return
-
-    if side == "BUY":
-        sl = price - data["atr"] * 1.5
-        tp1 = price + data["atr"] * 1.5
-        tp2 = price + data["atr"] * 2.5
-        tp3 = price + data["atr"] * 3.5
-
+    # ATR-based risk management
+    if direction == "BUY":
+        sl = price - (atr * 1.5)
+        tp1 = price + (atr * 1.5)
+        tp2 = price + (atr * 2.5)
     else:
-        sl = price + data["atr"] * 1.5
-        tp1 = price - data["atr"] * 1.5
-        tp2 = price - data["atr"] * 2.5
-        tp3 = price - data["atr"] * 3.5
+        sl = price + (atr * 1.5)
+        tp1 = price - (atr * 1.5)
+        tp2 = price - (atr * 2.5)
 
-    msg = (
-        f"📈 {side} - XAU/USD GOLD\n"
-        f"Setup: {data['setup']}\n"
-        f"Technical Score: {data['score']}/100\n\n"
-
-        f"Entry: {price:.2f}\n"
-        f"SL: {sl:.2f}\n"
-        f"TP1: {tp1:.2f}\n"
-        f"TP2: {tp2:.2f}\n"
-        f"BIG TP: {tp3:.2f}\n\n"
-
-        f"RSI: {data['rsi']:.1f}\n"
-        f"EMA20: {data['ema20']:.2f}\n"
-        f"EMA50: {data['ema50']:.2f}\n\n"
-
-        f"Support: {data['support']:.2f}\n"
-        f"Resistance: {data['resistance']:.2f}\n\n"
-
-        f"Candle: {candle_label}\n"
-        "Gold Only | 15M | Real Market Feed\n"
-        "Score is not guaranteed win probability."
+    message = (
+        f"📊 {name} | {direction}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"💰 Entry: {price:.4f}\n"
+        f"🛑 Stop Loss: {sl:.4f}\n"
+        f"🎯 TP1: {tp1:.4f}\n"
+        f"🎯 TP2: {tp2:.4f}\n"
+        f"━━━━━━━━━━━━━━\n"
+        f"📈 RSI: {rsi:.1f}\n"
+        f"EMA20: {ema20:.4f}\n"
+        f"EMA50: {ema50:.4f}\n"
+        f"Support: {support:.4f}\n"
+        f"Resistance: {resistance:.4f}\n"
+        f"📌 Setup: {reason}\n"
+        f"⏱ Timeframe: 15 Minutes\n"
+        f"⚠️ Demo signal - confirm broker price"
     )
 
-    if send_msg(msg):
-        last_signal_key = signal_key
-        last_signal_time = time.time()
+    if send_telegram(message):
+        last_signals[name] = signal_key
+        return message
 
+    return None
+
+
+# =============== BOT LOOP ===============
+
+def trading_loop():
+    logging.info("Trading bot started")
+
+    while True:
+        try:
+            for name, symbol in ASSETS.items():
+                try:
+                    analyze_asset(name, symbol)
+                except Exception as e:
+                    logging.error("%s analysis error: %s", name, e)
+
+                time.sleep(3)
+
+        except Exception as e:
+            logging.error("Main loop error: %s", e)
+
+        time.sleep(CHECK_SECONDS)
+
+
+def start_bot():
+    global bot_started
+
+    if not bot_started:
+        bot_started = True
+
+        thread = threading.Thread(
+            target=trading_loop,
+            daemon=True
+        )
+        thread.start()
+
+
+# =============== FLASK / RENDER ===============
 
 @app.route("/")
 def home():
-    candles = get_candles()
-
-    if not candles:
-        return "Gold data unavailable - WAIT"
-
-    return (
-        "GOLD REJECTION + BREAKOUT BOT ACTIVE | "
-        + str(candles[-1]["close"])
-    )
+    return "GOLD + ETH + BTC + USOIL SIGNAL BOT ACTIVE"
 
 
 @app.route("/test")
 def test():
-    run_bot()
-    return "Gold scan completed. Check Telegram."
+    return jsonify({
+        "status": "running",
+        "assets": list(ASSETS.keys()),
+        "timeframe": TIMEFRAME
+    })
 
 
-def auto():
-    while True:
-        try:
-            run_bot()
-        except Exception as e:
-            print("Bot error:", e)
+@app.route("/health")
+def health():
+    return jsonify({"status": "ok"})
 
-        time.sleep(SCAN_INTERVAL)
 
+start_bot()
 
 if __name__ == "__main__":
-
-    threading.Thread(
-        target=auto,
-        daemon=True
-    ).start()
-
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
-    )
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
