@@ -1,5 +1,6 @@
-flask
+Flask==2.3.3
+requests==2.31.0
 yfinance
 pandas
 ta
-python-telegram-bot[job-queue]
+python-telegram-bot
