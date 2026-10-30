@@ -1,4 +1,3 @@
-"""
 FINAL LIVE PRICE BOT - No hardcoded 3882, pure live APIs
 Gold live from 3 sources, median filter, no 3898 bug
 """
