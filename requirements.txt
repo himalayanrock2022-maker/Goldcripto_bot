@@ -1,5 +1,5 @@
-python-telegram-bot[job-queue]==20.7
+flask
 yfinance
 pandas
 ta
-flask
+python-telegram-bot[job-queue]
